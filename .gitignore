@@ -1,0 +1,7 @@
+# never commit secrets
+*.session
+session.key
+widget.pos
+.env
+__pycache__/
+*.pyc
