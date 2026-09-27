@@ -2,6 +2,7 @@
 *.session
 session.key
 widget.pos
+history.json
 .env
 __pycache__/
 *.pyc

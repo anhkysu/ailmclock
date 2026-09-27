@@ -1,10 +1,30 @@
 # ailimclock
 
+The current version for this setup is **Codex Usage**. The original combined
+Claude/Codex widget remains available through `ailimclock.vbs`.
+
 A tiny clock for your AI coding usage limits — shows the **5-hour session** and
 **weekly** windows (with reset times) for **Claude** *and* **OpenAI Codex**, in a
 CLI and an always-on-top desktop widget.
 
 No login flow, no third-party Python packages. Stdlib only.
+
+## Codex Usage (six profiles)
+
+`codex_usage_widget.py` is the current six-account version. It reads
+`auth.json` from `%USERPROFILE%\.codex` and `%USERPROFILE%\.codex2` through
+`%USERPROFILE%\.codex6`, and shows both the 5-hour and weekly usage windows for
+each account. Double-click
+`codex_usage.vbs` for the windowless launcher, or
+run `python codex_usage.py` for a CLI snapshot.
+
+Use the `WEEK −` button in the widget header to collapse the weekly rows and
+token totals. The same button restores them when needed.
+
+The input/output token totals are calculated from each profile's local Codex
+session logs and are recounted from zero at the server-reported weekly reset.
+Input includes cached tokens and only reflects activity retained on this
+computer, so it will not necessarily map directly to the quota percentage.
 
 ## How it works
 Two providers, two mechanisms — both reusing credentials already on your machine:

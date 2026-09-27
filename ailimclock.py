@@ -97,8 +97,9 @@ def _extract(bucket) -> tuple:
         if k in bucket and bucket[k] is not None:
             pct = float(bucket[k])
             break
-    if pct is not None and pct <= 1.0:  # some fields are 0..1, others 0..100
-        pct *= 100
+    # Claude's `utilization` is already on a 0-100 scale (e.g. 2.0 means 2%).
+    # Do NOT rescale small values: a weekly window at 1.0% must stay 1%, not
+    # jump to 100%. (Same bug we already fixed for Codex.)
     reset = None
     for k in ("resets_at", "reset_at", "resets", "next_reset", "ends_at"):
         if k in bucket and bucket[k] is not None:

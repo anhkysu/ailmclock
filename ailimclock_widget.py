@@ -32,7 +32,18 @@ import codex
 HERE = os.path.dirname(os.path.abspath(__file__))
 KEY_FILE = os.path.join(HERE, "session.key")
 POS_FILE = os.path.join(HERE, "widget.pos")
+HIST_FILE = os.path.join(HERE, "history.json")
 REFRESH_MS = 60_000  # 60s
+
+# Pacing history, per window kind (keyed by the last word of a row label).
+# A 5-hour limit moves fast, so look back only 10 min; a weekly limit barely
+# budges in 10 min, so measure its pace over a few hours instead.
+HIST_LOOKBACK = {"5h": 10 * 60, "Wk": 3 * 3600}
+HIST_MIN_SPAN = {"5h": 3 * 60,  "Wk": 20 * 60}
+
+# How to show the burn rate, per window kind: (interval seconds, unit suffix).
+# 5-hour -> "%/h", weekly -> "%/24h".
+RATE_DISPLAY = {"5h": (3600, "/h"), "Wk": (86400, "/24h")}
 
 # Rows to display, in order: (label, bar color)
 # Bars keep two shades per provider (lighter = 5h, darker = weekly)...
@@ -52,6 +63,13 @@ LABEL_COLORS = {
 
 def label_color(label: str) -> str:
     return LABEL_COLORS.get(label.split()[0], "#dddddd")
+
+# Window lengths, keyed by the last word of a row label ("5h" / "Wk").
+# Used by the pacing advisor to know how far through a window we are.
+WINDOW_SECONDS = {
+    "5h": 5 * 3600,
+    "Wk": 7 * 86400,
+}
 
 # Claude usage payload -> row label, with field aliases (schema is undocumented).
 CLAUDE_MAP = {
@@ -83,6 +101,61 @@ def load_key(root) -> str:
     with open(KEY_FILE, "w", encoding="utf-8") as f:
         f.write(k)
     return k
+
+
+# ---------- usage history (for the trailing burn rate) ----------
+
+def load_history() -> dict:
+    """{row label -> [[epoch, pct], ...]} of past usage samples."""
+    if os.path.exists(HIST_FILE):
+        try:
+            with open(HIST_FILE, encoding="utf-8") as f:
+                h = json.load(f)
+                if isinstance(h, dict):
+                    return h
+        except (OSError, ValueError):
+            pass
+    return {}
+
+
+def save_history(hist: dict):
+    try:
+        with open(HIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(hist, f)
+    except OSError:
+        pass
+
+
+def trailing_rate(samples, window_start, now, lookback, min_span):
+    """Current burn rate in %/hour from recent samples, or None if unknown.
+
+    Only samples from the current window (ts >= window_start) are used, so a
+    reset -- which drops usage back near 0 -- never reads as a huge negative
+    rate. Needs at least two samples spanning `min_span` seconds.
+    """
+    if not samples:
+        return None
+    recent = [s for s in samples
+              if s[0] >= window_start and now - s[0] <= lookback]
+    if len(recent) < 2:
+        return None
+    recent.sort()
+    (t0, p0), (t1, p1) = recent[0], recent[-1]
+    span_h = (t1 - t0) / 3600
+    if span_h < min_span / 3600:
+        return None
+    return (p1 - p0) / span_h
+
+
+def fmt_rate(rate, label) -> str:
+    """Render a %/hour rate in the window's natural unit (%/10m or %/24h)."""
+    if rate is None:
+        return ""
+    secs, unit = RATE_DISPLAY.get(label.split()[-1], (3600, "/h"))
+    val = rate * secs / 3600
+    if abs(val) < 0.5:
+        return "flat"
+    return f"{val:+.0f}%{unit}"
 
 
 # ---------- position persistence ----------
@@ -145,6 +218,57 @@ def fmt_reset(dt):
     return cd, moment
 
 
+# ---------- pacing advisor ----------
+
+def _ratio_to_action(ratio):
+    """Map a (current pace / sustainable pace) ratio to an action + color."""
+    if ratio >= 1.5:
+        return "slow down", "#e06c6c"   # on track to exhaust before reset
+    if ratio >= 1.15:
+        return "ease up", "#e0b24c"
+    if ratio >= 0.6:
+        return "steady", "#5fb56f"
+    return "use more", "#6fa8d4"        # plenty of headroom -- safe to do more
+
+
+def pace_hint(label, pct, dt, rate=None):
+    """Judge usage pace for one window -> (note, color).
+
+    With a trailing `rate` (%/hour, from history) it compares how fast you're
+    *currently* burning against the rate you could sustain and still land at
+    100% exactly at reset. Without history yet, it falls back to a static
+    used%-vs-elapsed% estimate.
+    """
+    if pct is None or dt is None:
+        return "", "#9a9a9a"
+    win = WINDOW_SECONDS.get(label.split()[-1])
+    if not win:
+        return "", "#9a9a9a"
+    now = datetime.now(timezone.utc).astimezone()
+    remaining = (dt - now).total_seconds()
+
+    if pct >= 95:
+        return "stop", "#e06c6c"        # limit essentially spent
+
+    if rate is not None:
+        # Dynamic: compare the *current* burn rate to what's sustainable.
+        remaining_h = remaining / 3600
+        if remaining_h <= 0:
+            return "go ahead", "#9a9a9a"   # resetting now
+        sustainable = (100 - pct) / remaining_h    # %/h you can keep up
+        # Low/zero rate naturally yields a small ratio -> "use more".
+        ratio = rate / sustainable if sustainable > 0 else 99
+        return _ratio_to_action(ratio)
+
+    # Static fallback (no history yet): used% vs fraction of window elapsed.
+    frac = min(1.0, max(0.0, (win - remaining) / win))
+    if frac < 0.08:
+        return "go ahead", "#9a9a9a"    # fresh window -- use it freely
+    expected = frac * 100
+    ratio = pct / expected if expected > 0 else 0
+    return _ratio_to_action(ratio)
+
+
 # ---------- the widget ----------
 
 class Widget:
@@ -160,6 +284,8 @@ class Widget:
         self.session_key = load_key(self.root)
         self.org_id = None
         self.resets = {}                          # row label -> reset datetime
+        self.pcts = {}                            # row label -> used percent
+        self.history = load_history()             # row label -> [[epoch, pct]]
 
         self._build_ui()
         self._make_draggable()
@@ -192,11 +318,19 @@ class Widget:
             pct = tk.Label(row, text="--", width=4, anchor="e", fg="#dddddd",
                            bg="#1e1e1e", font=("Segoe UI", 9))
             pct.pack(side="left")
+            # current burn rate, e.g. "+12%/h" (5h) / "+14%/24h" (weekly)
+            rate = tk.Label(row, text="", width=9, anchor="e", fg="#9a9a9a",
+                            bg="#1e1e1e", font=("Segoe UI", 8))
+            rate.pack(side="left", padx=(6, 0))
             # width fits the longest reset string, e.g. "22h 53m -> Thu 08:03"
             rst = tk.Label(row, text="", width=21, anchor="e", fg="#9a9a9a",
                            bg="#1e1e1e", font=("Segoe UI", 8))
             rst.pack(side="left", padx=(6, 0))
-            self.bars[label] = (canvas, fill, pct, rst)
+            # pacing note (an action), e.g. "slow down" / "steady" / "use more"
+            hint = tk.Label(row, text="", width=9, anchor="e", fg="#9a9a9a",
+                            bg="#1e1e1e", font=("Segoe UI", 8, "bold"))
+            hint.pack(side="left", padx=(6, 0))
+            self.bars[label] = (canvas, fill, pct, rst, hint, rate)
 
         self.status = tk.Label(self.root, text="loading…", fg="#888",
                                bg="#1e1e1e", font=("Segoe UI", 8))
@@ -274,15 +408,24 @@ class Widget:
 
     def _render(self, merged: dict, errs: list):
         shown = 0
+        now = datetime.now(timezone.utc).timestamp()
         for label, _color in ROWS:
-            canvas, fill, pct_lbl, _rst = self.bars[label]
+            canvas, fill, pct_lbl, _rst, _hint, _rate = self.bars[label]
             bucket = merged.get(label)
             if not bucket:
                 canvas.coords(fill, 0, 0, 0, 12)
                 pct_lbl.config(text="--")
                 self.resets.pop(label, None)
+                self.pcts.pop(label, None)
                 continue
-            pct, reset = core._extract(bucket)
+            if label.startswith("Codex"):
+                # codex.normalized() already produced a final 0-100 percent and
+                # an absolute reset epoch. Do NOT re-run core._extract here: its
+                # "<=1.0 means a fraction, x100" heuristic would turn a just-reset
+                # 1% window into 100%.
+                pct, reset = bucket.get("utilization"), bucket.get("resets_at")
+            else:
+                pct, reset = core._extract(bucket)
             if pct is None:
                 pct_lbl.config(text="--")
                 continue
@@ -290,7 +433,13 @@ class Widget:
             w = int(140 * max(0.0, min(100.0, pct)) / 100)
             canvas.coords(fill, 0, 0, w, 12)
             pct_lbl.config(text=f"{pct:.0f}%")
-            self.resets[label] = parse_reset(reset)
+            new_reset = parse_reset(reset)
+            if self._reset_rolled(label, new_reset, pct):
+                self.history.pop(label, None)   # new window -> start history clean
+            self.resets[label] = new_reset
+            self.pcts[label] = pct
+            self._record(label, now, pct)
+        save_history(self.history)
         self._paint_resets()  # repaint countdowns immediately with the fresh data
 
         if errs:
@@ -301,16 +450,59 @@ class Widget:
             self.status.config(text="updated " + datetime.now().strftime("%H:%M"),
                                fg="#888")
 
+    def _reset_rolled(self, label, new_reset, pct):
+        """True if this row's window just reset since the last fetch.
+
+        Detected two ways: the reset moment jumped forward into a new window, or
+        usage fell sharply (a fresh window starts back near 0%).
+        """
+        prev_reset = self.resets.get(label)
+        if new_reset and prev_reset and \
+                (new_reset - prev_reset).total_seconds() > 120:
+            return True
+        prev_pct = self.pcts.get(label)
+        if prev_pct is not None and pct < prev_pct - 10:
+            return True
+        return False
+
+    def _record(self, label, now, pct):
+        """Append a usage sample and drop ones older than the current window."""
+        win = WINDOW_SECONDS.get(label.split()[-1], 0)
+        samples = self.history.setdefault(label, [])
+        samples.append([now, pct])
+        # Keep only this window's worth of history (+ a little slack).
+        cutoff = now - win - 60
+        samples[:] = [s for s in samples if s[0] >= cutoff][-500:]
+
+    def _rate_for(self, label, now):
+        """Trailing burn rate (%/h) for a row, scoped to its current window."""
+        suf = label.split()[-1]
+        win = WINDOW_SECONDS.get(suf)
+        dt = self.resets.get(label)
+        if not win or dt is None:
+            return None
+        window_start = dt.timestamp() - win
+        return trailing_rate(self.history.get(label, []), window_start, now,
+                             HIST_LOOKBACK.get(suf, 600),
+                             HIST_MIN_SPAN.get(suf, 180))
+
     def _paint_resets(self):
-        """Repaint the per-row reset countdowns from stored reset times."""
+        """Repaint the per-row reset countdowns + burn rate + pacing note."""
+        now = datetime.now(timezone.utc).timestamp()
         for label, _color in ROWS:
-            _c, _f, _p, rst = self.bars[label]
+            _c, _f, _p, rst, hint, rate_lbl = self.bars[label]
             dt = self.resets.get(label)
             if dt is None:
                 rst.config(text="")
+                hint.config(text="")
+                rate_lbl.config(text="")
                 continue
             cd, moment = fmt_reset(dt)
             rst.config(text=f"{cd} -> {moment}" if cd else "")
+            rate = self._rate_for(label, now)
+            rate_lbl.config(text=fmt_rate(rate, label))
+            note, color = pace_hint(label, self.pcts.get(label), dt, rate)
+            hint.config(text=note, fg=color)
 
     def _tick(self):
         """Tick the countdowns once a second (no network), then reschedule."""
